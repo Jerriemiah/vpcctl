@@ -1,0 +1,399 @@
+#!/usr/bin/env python3
+"""
+vpcctl - Build Your Own Virtual Private Cloud (Linux Edition)
+Refined: per-subnet gateway (bridge IP in each subnet), fixes for state keys,
+peering placement, idempotency on IP add, and NAT using INTERNET_IF variable.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import hashlib
+from pathlib import Path
+
+STATE_DIR = Path("/var/lib/vpcctl")
+INTERNET_IF = "enp0s3"  
+
+def run(cmd, check=True):
+    """Run a shell command, print it, return subprocess.CompletedProcess."""
+    print("+", " ".join(cmd))
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.stdout.strip():
+        print(result.stdout.strip())
+    if result.returncode != 0 and check:
+        print(result.stderr.strip(), file=sys.stderr)
+        sys.exit(result.returncode)
+    return result
+
+def short_hash(name):
+    return hashlib.md5(name.encode()).hexdigest()[:6]
+
+def short_name(prefix):
+    """Return a short safe interface/name using md5 slice."""
+    return f"{prefix[:6]}-{short_hash(prefix)}"
+
+# ---------------- State helpers ----------------
+def ensure_state_dir():
+    if not STATE_DIR.exists():
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+def vpc_state(vpc): return STATE_DIR / f"{vpc}.json"
+def vpc_ns(vpc): return f"ns-{vpc}"
+def bridge_name(vpc): return f"br-{vpc}"
+
+def save_state(data):
+    p = vpc_state(data["vpc_name"])
+    with open(p, "w") as f:
+        json.dump(data, f, indent=2)
+    print(f"✅ State saved: {p}")
+
+def load_state(vpc):
+    p = vpc_state(vpc)
+    if not p.exists(): return None
+    with open(p) as f:
+        return json.load(f)
+
+
+def setup_internet_gateway(vpc, ns_name, host_iface="enp0s3"):
+    """
+    Creates a veth pair between host and VPC namespace and attaches the namespace
+    end to the VPC bridge so subnets can reach the host. NAT is applied on the host
+    for the VPC CIDR (read from state).
+    """
+    suffix = vpc[:6]
+    veth_host = f"veth-{suffix}-h"
+    veth_ns = f"veth-{suffix}-n"
+
+    # deterministic small /30 per VPC to link host <-> vpc namespace
+    idx = abs(hash(vpc)) % 250
+    host_ip = f"172.31.{idx}.1"
+    ns_ip   = f"172.31.{idx}.2"
+    link_cidr = f"172.31.{idx}.0/30"
+
+    # bridge name inside the vpc namespace
+    br = f"br-{vpc}"
+
+    print(f"🌍 Setting up Internet Gateway for {vpc} ({veth_host} ↔ {veth_ns}); link {link_cidr}")
+
+    # cleanup any old host-side interface
+    subprocess.run(["ip","link","del", veth_host], stderr=subprocess.DEVNULL)
+
+    # create veth pair
+    run(["ip","link","add", veth_host, "type", "veth", "peer", "name", veth_ns])
+    # move namespace end into the vpc namespace
+    run(["ip","link","set", veth_ns, "netns", ns_name])
+
+    # configure host side
+    run(["ip","addr","add", f"{host_ip}/30", "dev", veth_host])
+    run(["ip","link","set", veth_host, "up"])
+
+    # configure namespace side AND attach it to the VPC bridge inside that namespace
+    run(["ip","netns","exec", ns_name, "ip", "link", "set", veth_ns, "up"])
+    # add ns_ip to the namespace-side interface (still the same interface)
+    run(["ip","netns","exec", ns_name, "ip", "addr", "add", f"{ns_ip}/30", "dev", veth_ns])
+    # attach the namespace-side veth to the bridge so packets from subnets reach it
+    run(["ip","netns","exec", ns_name, "ip", "link", "set", veth_ns, "master", br])
+
+    # add default route inside VPC namespace so bridge can forward non-local traffic to host
+    run(["ip","netns","exec", ns_name, "ip","route","add","default","via", host_ip, "dev", veth_ns], check=False)
+
+    # Enable forwarding on host
+    run(["sysctl","-w","net.ipv4.ip_forward=1"])
+
+    # Determine VPC CIDR from saved state so NAT uses the VPC range (not the /30)
+    st = load_state(vpc)
+    if st and "cidr" in st:
+        vpc_cidr = st["cidr"]
+    else:
+        # fallback to NAT-ing the entire 10.0.0.0/8 to be safe (shouldn't be used normally)
+        vpc_cidr = "10.0.0.0/8"
+
+    # Add MASQUERADE rule on host for the VPC CIDR (idempotent approach)
+    run(["iptables","-t","nat","-C","POSTROUTING","-s", vpc_cidr, "-o", host_iface, "-j", "MASQUERADE"], check=False)
+    run(["iptables","-t","nat","-A","POSTROUTING","-s", vpc_cidr, "-o", host_iface, "-j", "MASQUERADE"])
+
+    # Allow forwarding between host external iface and the host veth
+    run(["iptables","-C","FORWARD","-i", host_iface, "-o", veth_host, "-m","state","--state","RELATED,ESTABLISHED","-j","ACCEPT"], check=False)
+    run(["iptables","-A","FORWARD","-i", host_iface, "-o", veth_host, "-m","state","--state","RELATED,ESTABLISHED","-j","ACCEPT"])
+    run(["iptables","-C","FORWARD","-i", veth_host, "-o", host_iface, "-j","ACCEPT"], check=False)
+    run(["iptables","-A","FORWARD","-i", veth_host, "-o", host_iface, "-j","ACCEPT"])
+
+    print(f"✅ Internet Gateway configured for {vpc} (vpc_cidr={vpc_cidr}).")
+
+
+# ---------------- VPC Creation ----------------
+def create_vpc(args):
+    vpc = args.name
+    cidr = args.cidr
+    if not vpc or not cidr:
+        sys.exit("create-vpc requires --name and --cidr")
+    ensure_state_dir()
+    if load_state(vpc):
+        print(f"⚠️  VPC {vpc} already exists (idempotent).")
+        return
+
+    ns = vpc_ns(vpc)
+    br = bridge_name(vpc)
+
+    print(f"🧱 Creating VPC {vpc} (CIDR={cidr}) with namespace {ns} and bridge {br}")
+
+    run(["ip", "netns", "add", ns])
+    run(["ip", "netns", "exec", ns, "ip", "link", "add", br, "type", "bridge"])
+    run(["ip", "netns", "exec", ns, "ip", "link", "set", br, "up"])
+    # Enable forwarding inside VPC namespace
+    run(["ip", "netns", "exec", ns, "sysctl", "-w", "net.ipv4.ip_forward=1"])
+
+    state = {
+        "vpc_name": vpc,
+        "cidr": cidr,
+        "namespace": ns,
+        "bridge": br,
+        "subnets": {},   # map subnet-name -> metadata including gateway
+        "peers": {}
+    }
+    save_state(state)
+
+    setup_internet_gateway(vpc, ns, host_iface="enp0s3")
+    print(f"✅ VPC {vpc} created.")
+
+# ---------------- Subnet Creation ----------------
+def add_subnet(args):
+    vpc = args.vpc
+    subnet = args.name
+    cidr = args.cidr
+    is_public = getattr(args, "public", False)
+
+    if not (vpc and subnet and cidr):
+        sys.exit("add-subnet requires --vpc, --name, and --cidr")
+
+    state = load_state(vpc)
+    if not state:
+        sys.exit(f"❌ VPC {vpc} not found. Create it first.")
+
+    if subnet in state["subnets"]:
+        print(f"⚠️ Subnet {subnet} already exists (idempotent).")
+        return
+
+    vpc_ns_name = state["namespace"]
+    br = state["bridge"]
+
+    ns_subnet = f"ns-{vpc}-{subnet}"
+    veth_host = f"veth-{short_hash(vpc + subnet)}-h"
+    veth_ns = f"veth-{short_hash(vpc + subnet)}-n"
+
+    print(f"🧱 Creating subnet {subnet} ({cidr}) inside VPC {vpc}...")
+
+    # Create the subnet namespace
+    run(["ip", "netns", "add", ns_subnet])
+
+    # Make veth pair (root), then move ends into namespaces
+    run(["ip", "link", "add", veth_host, "type", "veth", "peer", "name", veth_ns])
+    # Move host side into VPC namespace
+    run(["ip", "link", "set", veth_host, "netns", vpc_ns_name])
+    # Move ns side into subnet namespace
+    run(["ip", "link", "set", veth_ns, "netns", ns_subnet])
+
+    # Inside VPC namespace: attach host-side to bridge and bring up
+    run(["ip", "netns", "exec", vpc_ns_name, "ip", "link", "set", veth_host, "master", br])
+    run(["ip", "netns", "exec", vpc_ns_name, "ip", "link", "set", veth_host, "up"])
+
+    # Inside subnet namespace: bring up interfaces and loopback
+    run(["ip", "netns", "exec", ns_subnet, "ip", "link", "set", veth_ns, "up"])
+    run(["ip", "netns", "exec", ns_subnet, "ip", "link", "set", "lo", "up"])
+
+    
+    # Compute gateway for this subnet: use .1 in the subnet
+    # Accept subnets like 10.10.1.0/24, 192.168.5.0/24
+    try:
+        net_base = cidr.split('/')[0]
+        # base without last octet
+        base_ip = net_base.rsplit('.', 1)[0]
+        gw_ip = f"{base_ip}.1"
+        ns_ip = f"{base_ip}.2"
+        mask = cidr.split('/')[1]
+    except Exception as e:
+        sys.exit(f"Invalid CIDR format: {cidr}")
+
+    # Assign IP inside subnet namespace
+    run(["ip", "netns", "exec", ns_subnet, "ip", "addr", "add", f"{ns_ip}/{mask}", "dev", veth_ns])
+
+    # Add default route inside namespace via gateway (which must be on the bridge)
+    run(["ip", "netns", "exec", ns_subnet, "ip", "route", "add", "default", "via", gw_ip])
+
+    # Add gateway IP to the bridge inside the VPC namespace.
+    # Idempotent: attempt once, allow non-zero return (address might already exist).
+    run(["ip", "netns", "exec", vpc_ns_name, "ip", "addr", "add", f"{gw_ip}/{mask}", "dev", br], check=False)
+
+    # Save subnet info
+    state["subnets"][subnet] = {
+        "cidr": cidr,
+        "namespace": ns_subnet,
+        "veth_host": veth_host,
+        "veth_ns": veth_ns,
+        "ns_ip": ns_ip,
+        "gateway": gw_ip,
+        "public": bool(is_public)
+    }
+    save_state(state)
+    print(f"✅ Subnet {subnet} added to {vpc} (ns={ns_subnet}, gw={gw_ip})")
+
+    # Setup NAT if public
+    if is_public:
+        print(f"🌍 Enabling NAT for {subnet} via {INTERNET_IF}...")
+        # Enable forwarding in the VPC namespace
+        run(["ip", "netns", "exec", vpc_ns_name, "sysctl", "-w", "net.ipv4.ip_forward=1"])
+        # NAT rule: -s must match the subnet CIDR
+        run(["ip", "netns", "exec", vpc_ns_name, "iptables", "-t", "nat", "-A", "POSTROUTING",
+             "-s", cidr, "-o", INTERNET_IF, "-j", "MASQUERADE"])
+        run(["ip", "netns", "exec", vpc_ns_name, "iptables", "-A", "FORWARD", "-i", br, "-o", INTERNET_IF, "-j", "ACCEPT"])
+        run(["ip", "netns", "exec", vpc_ns_name, "iptables", "-A", "FORWARD", "-o", br, "-m", "state",
+             "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"])
+        print("✅ NAT configured.")
+
+# ---------------- Peering ----------------
+
+def peer_vpcs(args):
+    a, b = args.a, args.b
+    if not (a and b):
+        sys.exit("peer-vpcs requires --a and --b")
+
+    # Load both VPC states
+    state_a = load_state(a)
+    state_b = load_state(b)
+    if not state_a or not state_b:
+        sys.exit("❌ One or both VPCs not found. Create them first.")
+
+    ns_a, br_a, cidr_a = state_a["namespace"], state_a["bridge"], state_a["cidr"]
+    ns_b, br_b, cidr_b = state_b["namespace"], state_b["bridge"], state_b["cidr"]
+
+    # Generate interface names
+    if_a = short_name(f"peer-{a}-{b}-a")
+    if_b = short_name(f"peer-{a}-{b}-b")
+
+    print(f"🔗 Creating peering veth pair {if_a} <-> {if_b} between {a} and {b}")
+
+    # Clean up old interfaces if they exist
+    subprocess.run(["ip", "link", "del", if_a], stderr=subprocess.DEVNULL)
+    subprocess.run(["ip", "link", "del", if_b], stderr=subprocess.DEVNULL)
+
+    # Create the veth pair in root
+    run(["ip", "link", "add", if_a, "type", "veth", "peer", "name", if_b])
+
+    # Move each end to its respective namespace
+    run(["ip", "link", "set", if_a, "netns", ns_a])
+    run(["ip", "link", "set", if_b, "netns", ns_b])
+
+    # Attach to VPC bridges and bring up interfaces
+    run(["ip", "netns", "exec", ns_a, "ip", "link", "set", if_a, "master", br_a])
+    run(["ip", "netns", "exec", ns_a, "ip", "link", "set", if_a, "up"])
+    run(["ip", "netns", "exec", ns_b, "ip", "link", "set", if_b, "master", br_b])
+    run(["ip", "netns", "exec", ns_b, "ip", "link", "set", if_b, "up"])
+
+    # Enable IP forwarding inside both VPCs
+    run(["ip", "netns", "exec", ns_a, "sysctl", "-w", "net.ipv4.ip_forward=1"])
+    run(["ip", "netns", "exec", ns_b, "sysctl", "-w", "net.ipv4.ip_forward=1"])
+
+    # Add static routes for cross-VPC communication
+    print(f"📡 Adding static routes: {cidr_a} ↔ {cidr_b}")
+    run(["ip", "netns", "exec", ns_a, "ip", "route", "add", cidr_b, "dev", br_a])
+    run(["ip", "netns", "exec", ns_b, "ip", "route", "add", cidr_a, "dev", br_b])
+
+    # Save peering info to both states
+    state_a.setdefault("peers", {})[b] = {"if": if_a, "cidr": cidr_b}
+    state_b.setdefault("peers", {})[a] = {"if": if_b, "cidr": cidr_a}
+    save_state(state_a)
+    save_state(state_b)
+
+    print(f"✅ Peering established between {a} and {b}. Cross-VPC routes installed.")
+
+
+# ---------------- Firewall (Security Groups) ----------------
+def apply_firewall(args):
+    vpc = args.vpc
+    policy_path = args.policy
+    state = load_state(vpc)
+    if not state:
+        sys.exit(f"VPC {vpc} not found")
+    with open(policy_path) as f:
+        policy = json.load(f)
+    subnet_name = policy["subnet"]
+    if subnet_name not in state["subnets"]:
+        sys.exit(f"Subnet {subnet_name} not found in VPC {vpc}")
+    ns = state["subnets"][subnet_name]["namespace"]
+    rules = policy.get("ingress", [])
+
+    print(f"Applying firewall into namespace {ns}...")
+    # Flush and set default deny
+    run(["ip", "netns", "exec", ns, "iptables", "-F"])
+    run(["ip", "netns", "exec", ns, "iptables", "-P", "INPUT", "DROP"])
+    # Allow loopback
+    run(["ip", "netns", "exec", ns, "iptables", "-A", "INPUT", "-i", "lo", "-j", "ACCEPT"])
+    for r in rules:
+        port = str(r["port"])
+        proto = r["protocol"]
+        action = r["action"].lower()
+        act = "ACCEPT" if action == "allow" else "DROP"
+        run(["ip", "netns", "exec", ns, "iptables", "-A", "INPUT", "-p", proto, "--dport", port, "-j", act])
+        print(f"  - {act} {proto} port {port}")
+
+    print("✅ Firewall applied.")
+
+# ---------------- Inspection & Deletion ----------------
+def inspect_vpc(args):
+    name = args.name
+    state = load_state(name)
+    if not state:
+        sys.exit("No such VPC")
+    print(json.dumps(state, indent=2))
+    run(["ip", "netns", "list"])
+    run(["ip", "link", "show", "type", "bridge"])
+
+def delete_vpc(args):
+    vpc = args.name
+    state = load_state(vpc)
+    if not state:
+        print(f"VPC {vpc} not found; nothing to delete.")
+        return
+    ns = state["namespace"]
+    # Delete subnet namespaces
+    for s_meta in state["subnets"].values():
+        ns_sub = s_meta.get("namespace")
+        if ns_sub:
+            run(["ip", "netns", "delete", ns_sub], check=False)
+    # Delete peering interfaces and bridge namespace
+    run(["ip", "netns", "delete", ns], check=False)
+    p = vpc_state(vpc)
+    if p.exists(): p.unlink()
+    print(f"✅ Deleted {vpc}")
+
+# ---------------- CLI ----------------
+def main():
+    if os.geteuid() != 0:
+        sys.exit("Run as root (sudo)")
+
+    parser = argparse.ArgumentParser(description="vpcctl - Linux VPC CLI")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    c1 = sub.add_parser("create-vpc"); c1.add_argument("--name", required=True); c1.add_argument("--cidr", required=True)
+    c2 = sub.add_parser("add-subnet"); c2.add_argument("--vpc", required=True); c2.add_argument("--name", required=True); c2.add_argument("--cidr", required=True); c2.add_argument("--public", action="store_true")
+    c3 = sub.add_parser("apply-firewall"); c3.add_argument("--vpc", required=True); c3.add_argument("--policy", required=True)
+    c4 = sub.add_parser("peer-vpcs"); c4.add_argument("--a", required=True); c4.add_argument("--b", required=True)
+    c5 = sub.add_parser("inspect-vpc"); c5.add_argument("--name", required=True)
+
+    c6 = sub.add_parser("delete-vpc"); c6.add_argument("--name", required=True)
+
+    args = parser.parse_args()
+    cmds = {
+        "create-vpc": create_vpc,
+        "add-subnet": add_subnet,
+        "apply-firewall": apply_firewall,
+        "peer-vpcs": peer_vpcs,
+        "inspect-vpc": inspect_vpc,
+        "delete-vpc": delete_vpc,
+    }
+    cmds[args.cmd](args)
+
+if __name__ == "__main__":
+    main()
+

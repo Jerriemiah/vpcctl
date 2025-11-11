@@ -1,0 +1,7 @@
+{
+  "subnet": "public",
+  "ingress": [
+    {"port": 80, "protocol": "tcp", "action": "allow"},
+    {"port": 22, "protocol": "tcp", "action": "deny"}
+  ]
+}
